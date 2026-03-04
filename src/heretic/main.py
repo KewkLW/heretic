@@ -144,6 +144,11 @@ def run():
     )
     print()
 
+    # Extract --auto-continue before pydantic-settings parses argv.
+    auto_continue = "--auto-continue" in sys.argv
+    if auto_continue:
+        sys.argv.remove("--auto-continue")
+
     if (
         # There is at least one argument (argv[0] is the program name).
         len(sys.argv) > 1
@@ -252,62 +257,72 @@ def run():
         existing_study = None
 
     if existing_study is not None and settings.evaluate_model is None:
-        choices = []
-
-        if existing_study.user_attrs["finished"]:
+        if auto_continue:
+            # Non-interactive mode: auto-continue from existing checkpoint.
             print()
-            print(
-                (
-                    "[green]You have already processed this model.[/] "
-                    "You can show the results from the previous run, allowing you to export models or to run additional trials. "
-                    "Alternatively, you can ignore the previous run and start from scratch. "
-                    "This will delete the checkpoint file and all results from the previous run."
-                )
-            )
-            choices.append(
-                Choice(
-                    title="Show the results from the previous run",
-                    value="continue",
-                )
-            )
+            print("[yellow]Auto-continuing from existing checkpoint.[/]")
+            # Don't load saved settings — use the ones from the command line
+            # so that n_trials and n_startup_trials can be overridden.
+            choice = "continue_no_override"
         else:
-            print()
-            print(
-                (
-                    "[yellow]You have already processed this model, but the run was interrupted.[/] "
-                    "You can continue the previous run from where it stopped. This will override any specified settings. "
-                    "Alternatively, you can ignore the previous run and start from scratch. "
-                    "This will delete the checkpoint file and all results from the previous run."
+            choices = []
+
+            if existing_study.user_attrs["finished"]:
+                print()
+                print(
+                    (
+                        "[green]You have already processed this model.[/] "
+                        "You can show the results from the previous run, allowing you to export models or to run additional trials. "
+                        "Alternatively, you can ignore the previous run and start from scratch. "
+                        "This will delete the checkpoint file and all results from the previous run."
+                    )
                 )
-            )
+                choices.append(
+                    Choice(
+                        title="Show the results from the previous run",
+                        value="continue",
+                    )
+                )
+            else:
+                print()
+                print(
+                    (
+                        "[yellow]You have already processed this model, but the run was interrupted.[/] "
+                        "You can continue the previous run from where it stopped. This will override any specified settings. "
+                        "Alternatively, you can ignore the previous run and start from scratch. "
+                        "This will delete the checkpoint file and all results from the previous run."
+                    )
+                )
+                choices.append(
+                    Choice(
+                        title="Continue the previous run",
+                        value="continue",
+                    )
+                )
+
             choices.append(
                 Choice(
-                    title="Continue the previous run",
-                    value="continue",
+                    title="Ignore the previous run and start from scratch",
+                    value="restart",
                 )
             )
 
-        choices.append(
-            Choice(
-                title="Ignore the previous run and start from scratch",
-                value="restart",
+            choices.append(
+                Choice(
+                    title="Exit program",
+                    value="",
+                )
             )
-        )
 
-        choices.append(
-            Choice(
-                title="Exit program",
-                value="",
-            )
-        )
-
-        print()
-        choice = prompt_select("How would you like to proceed?", choices)
+            print()
+            choice = prompt_select("How would you like to proceed?", choices)
 
         if choice == "continue":
             settings = Settings.model_validate_json(
                 existing_study.user_attrs["settings"]
             )
+        elif choice == "continue_no_override":
+            pass  # Keep command-line settings as-is
         elif choice == "restart":
             os.unlink(study_checkpoint_file)
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
@@ -333,7 +348,7 @@ def run():
         print()
         print("Determining optimal batch size...")
 
-        batch_size = 1
+        batch_size = settings.min_batch_size
         best_batch_size = -1
         best_performance = -1
 
@@ -414,7 +429,7 @@ def run():
         settings.model = settings.evaluate_model
         model.reset_model()
         print("* Evaluating...")
-        evaluator.get_score()
+        evaluator.get_score()  # return value unused in evaluate-only mode
         return
 
     print()
@@ -496,7 +511,7 @@ def run():
             max_weight = trial.suggest_float(
                 f"{component}.max_weight",
                 0.8,
-                1.5,
+                2.5,
             )
             max_weight_position = trial.suggest_float(
                 f"{component}.max_weight_position",
@@ -539,7 +554,7 @@ def run():
         print("* Abliterating...")
         model.abliterate(refusal_directions, direction_index, parameters)
         print("* Evaluating...")
-        score, kl_divergence, refusals = evaluator.get_score()
+        score, kl_divergence, refusals, false_refusals = evaluator.get_score()
 
         elapsed_time = time.perf_counter() - start_time
         remaining_time = (elapsed_time / (trial_index - start_index)) * (
@@ -555,6 +570,7 @@ def run():
 
         trial.set_user_attr("kl_divergence", kl_divergence)
         trial.set_user_attr("refusals", refusals)
+        trial.set_user_attr("false_refusals", false_refusals)
 
         return score
 
@@ -604,6 +620,26 @@ def run():
     if count_completed_trials() == settings.n_trials:
         study.set_user_attr("finished", True)
 
+    # In auto-continue (headless) mode, exit after optimization completes.
+    # The user can resume interactively later to save/export the model.
+    if auto_continue:
+        completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        if completed_trials:
+            sorted_trials = sorted(
+                completed_trials,
+                key=lambda trial: (
+                    trial.user_attrs["refusals"],
+                    trial.user_attrs["kl_divergence"],
+                ),
+            )
+            best = sorted_trials[0]
+            print()
+            print(f"[bold green]Optimization finished! {len(completed_trials)} trials completed.[/]")
+            print(f"Best trial: Refusals {best.user_attrs['refusals']}/{len(evaluator.bad_prompts)}, KL {best.user_attrs['kl_divergence']:.4f}")
+            print()
+            print("Run again without --auto-continue to save/export/chat with the model.")
+        return
+
     while True:
         # If no trials at all have been evaluated, the study must have been stopped
         # by pressing Ctrl+C while the first trial was running. In this case, we just
@@ -630,13 +666,20 @@ def run():
                 min_divergence = kl_divergence
                 best_trials.append(trial)
 
+        def format_trial_choice(trial):
+            title = (
+                f"[Trial {trial.user_attrs['index']:>3}] "
+                f"Refusals: {trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
+                f"KL divergence: {trial.user_attrs['kl_divergence']:.4f}"
+            )
+            fr = trial.user_attrs.get("false_refusals", 0)
+            if fr > 0:
+                title += f", False refusals: {fr}/{len(evaluator.good_prompts)}"
+            return title
+
         choices = [
             Choice(
-                title=(
-                    f"[Trial {trial.user_attrs['index']:>3}] "
-                    f"Refusals: {trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
-                    f"KL divergence: {trial.user_attrs['kl_divergence']:.4f}"
-                ),
+                title=format_trial_choice(trial),
                 value=trial,
             )
             for trial in best_trials

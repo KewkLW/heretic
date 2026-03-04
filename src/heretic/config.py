@@ -125,6 +125,11 @@ class Settings(BaseSettings):
         description="Maximum batch size to try when automatically determining the optimal batch size.",
     )
 
+    min_batch_size: int = Field(
+        default=1,
+        description="Minimum batch size to start from when automatically determining the optimal batch size.",
+    )
+
     max_response_length: int = Field(
         default=100,
         description="Maximum number of tokens to generate for each response.",
@@ -173,6 +178,34 @@ class Settings(BaseSettings):
         description=(
             "The KL divergence to target. Below this value, an objective based on the refusal count is used. "
             'This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".'
+        ),
+    )
+
+    kl_tokens: int = Field(
+        default=1,
+        description=(
+            "Number of tokens to generate when computing KL divergence. "
+            "Higher values give a more robust quality signal at the cost of slower evaluation. "
+            "The KL divergence is averaged across all token positions. "
+            "Recommended: 1 (fastest, default), 3-5 (good tradeoff), >5 (diminishing returns)."
+        ),
+    )
+
+    detect_false_refusals: bool = Field(
+        default=False,
+        description=(
+            "Whether to detect false refusals on benign (good) prompts during evaluation. "
+            "When enabled, the model is checked for refusing harmless prompts that it shouldn't refuse. "
+            "False refusals are penalized in the KL divergence component of the optimization score."
+        ),
+    )
+
+    false_refusal_weight: float = Field(
+        default=0.5,
+        description=(
+            "Weight for false refusal penalty when detect_false_refusals is enabled. "
+            "The penalty is: weight * (false_refusals / total_good_prompts). "
+            "Higher values more aggressively penalize over-abliteration."
         ),
     )
 

@@ -161,14 +161,19 @@ class Model:
         assert isinstance(self.model, PreTrainedModel)
 
         # Always use LoRA adapters for abliteration (faster reload, no weight modification).
-        # We use the leaf names (e.g. "o_proj") as target modules.
-        # This may cause LoRA adapters to be attached to unrelated modules (e.g. "conv.o_proj"),
-        # but this is harmless as we only abliterate the modules we target in `abliterate()`,
-        # leaving the others at their default (identity) state.
-        # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
-        target_modules = [
-            comp.split(".")[-1] for comp in self.get_abliterable_components()
-        ]
+        # Scan all layers to discover target module leaf names, handling hybrid architectures
+        # (e.g. Qwen3.5 DeltaNet+Attention) where different layers use different module names
+        # for the same logical function (self_attn.o_proj vs linear_attn.out_proj).
+        target_modules = set()
+        for layer_index in range(len(self.get_layers())):
+            layer = self.get_layers()[layer_index]
+            for comp, modules in self.get_layer_modules(layer_index).items():
+                for mod in modules:
+                    for name, m in layer.named_modules():
+                        if m is mod:
+                            target_modules.add(name.split(".")[-1])
+                            break
+        target_modules = list(target_modules)
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -340,9 +345,14 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # Exceptions aren't suppressed here, because there is currently
-        # no alternative location for the attention out-projection.
-        try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
+        # Standard softmax attention layers.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # Hybrid DeltaNet/linear attention layers (e.g. Qwen3.5).
+        # Unified under "attn.o_proj" so both layer types share one search space.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Most dense models.
         with suppress(Exception):
@@ -374,7 +384,13 @@ class Model:
         return modules
 
     def get_abliterable_components(self) -> list[str]:
-        return list(self.get_layer_modules(0).keys())
+        # Scan all layers to discover all component types.
+        # Needed for hybrid architectures where layer 0 may not have
+        # all component types (e.g. Qwen3.5 DeltaNet vs softmax layers).
+        components = set()
+        for i in range(len(self.get_layers())):
+            components.update(self.get_layer_modules(i).keys())
+        return sorted(components)
 
     def abliterate(
         self,
@@ -656,11 +672,11 @@ class Model:
     # We work with logprobs rather than probabilities for numerical stability
     # when computing the KL divergence.
     def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
-        # We only generate one token, and we return the (log) probability distributions
-        # over the vocabulary at that token position, for each prompt.
+        n_tokens = self.settings.kl_tokens
+
         _, outputs = self.generate(
             prompts,
-            max_new_tokens=1,
+            max_new_tokens=n_tokens,
             output_scores=True,
             return_dict_in_generate=True,
         )
@@ -669,12 +685,19 @@ class Model:
         # of model.generate with return_dict_in_generate=True.
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
 
-        # Logits for the first (only) generated token.
         # This cast is valid because we passed output_scores=True above.
-        logits = cast(tuple[FloatTensor], outputs.scores)[0]
+        scores = cast(tuple[FloatTensor], outputs.scores)
 
-        # The returned tensor has shape (prompt, token).
-        return F.log_softmax(logits, dim=-1)
+        if n_tokens == 1:
+            # Original single-token path: shape (prompt, vocab).
+            return F.log_softmax(scores[0], dim=-1)
+
+        # Multi-token: stack all positions, reshape to (prompt * n_tokens, vocab)
+        # so KL div with batchmean naturally averages across all positions.
+        all_logits = torch.stack(list(scores), dim=0)  # (n_tokens, prompt, vocab)
+        all_logits = all_logits.permute(1, 0, 2).reshape(-1, all_logits.shape[-1])
+
+        return F.log_softmax(all_logits, dim=-1)
 
     def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:
         logprobs = []
